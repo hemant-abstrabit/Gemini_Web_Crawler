@@ -1,0 +1,17 @@
+[project]
+name = "web-scraper-ui"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.12.12",
+    "backoff>=2.2.1",
+    "beautifulsoup4>=4.13.4",
+    "fake-useragent>=2.2.0",
+    "google-genai>=1.19.0",
+    "google-generativeai>=0.8.5",
+    "playwright>=1.52.0",
+    "streamlit>=1.45.1",
+    "trafilatura>=2.0.0",
+]
