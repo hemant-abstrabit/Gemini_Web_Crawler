@@ -20,6 +20,12 @@ from google import genai
 import backoff
 from fake_useragent import UserAgent
 
+import nltk
+from nltk.data import find
+from nltk.tokenize import sent_tokenize
+# nltk.download('punkt')
+nltk.download('punkt_tab')
+
 # Suppress Windows-specific asyncio warnings
 if platform.system() == "Windows":
     warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed transport")
@@ -31,6 +37,33 @@ if platform.system() == "Windows":
 # =======================
 # CONFIGURATION & MODELS
 # =======================
+
+def split_content_into_chunks(content: str, max_chunk_chars: int = 14000) -> List[str]:
+    """
+    Split the content into sentence-aware chunks without overlap or mid-sentence breaks.
+    """
+    sentences = sent_tokenize(content)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if current_length + len(sentence) > max_chunk_chars:
+            # finalize current chunk
+            chunks.append(" ".join(current_chunk).strip())
+            current_chunk = [sentence]
+            current_length = len(sentence)
+        else:
+            current_chunk.append(sentence)
+            current_length += len(sentence)
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk).strip())
+
+    return chunks
 
 @dataclass
 class ScrapingConfig:
@@ -62,6 +95,15 @@ class ProductionWebScraper:
     """Production-ready universal web scraper"""
     
     def __init__(self, config: ScrapingConfig):
+
+        # Robust NLTK punkt setup
+        try:
+            find('tokenizers/punkt')
+            find('tokenizers/punkt_tab')
+        except LookupError:
+            nltk.download('punkt')
+            nltk.download('punkt_tab')
+        
         self.config = config
         self.setup_logging()
         self.setup_directories()
@@ -362,8 +404,8 @@ class ProductionWebScraper:
     )
     async def format_with_gemini(self, content: str, url: str) -> str:
         """
-        Format content using Gemini API with chunking for large content.
-        Ensures no data is lost due to token/input size limits.
+        Format content using Gemini API with sentence-aware chunking,
+        retry, exponential backoff, delay, and hallucination removal.
         """
         if not content:
             return ""
@@ -386,54 +428,45 @@ class ProductionWebScraper:
                 Content to format:
                 """
 
-            # Set safe chunk size (in characters)
-            chunk_size = 15000  # safe for Gemini models
-            overlap = 200       # optional: overlap between chunks to avoid mid-sentence cutoffs
-
-            # Chunk the input content
-            chunks = []
-            start = 0
-            while start < len(content):
-                end = start + chunk_size
-                # Avoid splitting words/sentences abruptly
-                if end < len(content):
-                    end = content.rfind('.', start, end) + 1 or end
-                chunk = content[start:end].strip()
-                if chunk:
-                    chunks.append(chunk)
-                start = end - overlap  # include slight overlap for continuity
-
+            chunks = split_content_into_chunks(content)
             formatted_chunks = []
+
             for idx, chunk in enumerate(chunks):
                 prompt = prompt_header + chunk
-                self.logger.info(f"Sending chunk {idx+1}/{len(chunks)} to Gemini...")
-                
+                self.logger.info(f"[{url}] Sending chunk {idx+1}/{len(chunks)} to Gemini...")
+
                 max_chunk_retries = 5
                 for attempt in range(max_chunk_retries):
                     try:
+
                         response = await asyncio.to_thread(
                             self.gemini_client.models.generate_content,
                             model="gemini-2.0-flash",
                             contents=prompt
                         )
                         formatted_text = response.text.strip()
+
+                        # Optional: Strip Gemini hallucinated markers
+                        # text = text.replace("[Start of Content]", "").replace("[End of Content]", "").strip()
+
                         formatted_chunks.append(formatted_text)
                         await asyncio.sleep(random.uniform(1.0, 2.5))  # throttle between calls
-                        break  # success, exit retry loop
+                        break  # exit retry loop on success
+
                     except Exception as e:
                         error_msg = str(e).lower()
-                        self.logger.warning(f"Gemini chunk {idx+1}/{len(chunks)} attempt {attempt+1} failed: {error_msg}")
+                        self.logger.warning(f"[{url}] Gemini chunk {idx+1} attempt {attempt+1} failed: {error_msg}")
 
                         if "429" in error_msg or "too many requests" in error_msg:
                             wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
-                            self.logger.warning(f"Rate limit hit. Waiting {wait_time:.1f}s before retrying...")
+                            self.logger.warning(f"[{url}] Rate limit hit. Waiting {wait_time:.1f}s...")
                             await asyncio.sleep(wait_time)
                         else:
                             # not a rate limit error — retry briefly, but not aggressively
                             await asyncio.sleep(1.0)
 
                         if attempt == max_chunk_retries - 1:
-                            self.logger.error(f"Max retries exceeded for chunk {idx+1}. Including raw chunk as-is.")
+                            self.logger.error(f"[{url}] Max retries exceeded for chunk {idx+1}. Including raw chunk.")
                             formatted_chunks.append(chunk)
 
             full_result = "\n\n".join(formatted_chunks)
@@ -441,7 +474,7 @@ class ProductionWebScraper:
 
         except Exception as e:
             self.logger.error(f"Gemini formatting failed for {url}: {e}")
-            return content  # fallback to unformatted content
+            return content # fallback to unformatted content
     
     async def scrape_single_url(self, url: str) -> ScrapingResult:
         """Scrape a single URL with comprehensive error handling"""
