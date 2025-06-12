@@ -408,13 +408,33 @@ class ProductionWebScraper:
                 prompt = prompt_header + chunk
                 self.logger.info(f"Sending chunk {idx+1}/{len(chunks)} to Gemini...")
                 
-                response = await asyncio.to_thread(
-                    self.gemini_client.models.generate_content,
-                    model="gemini-2.0-flash",
-                    contents=prompt
-                )
-                formatted_text = response.text.strip()
-                formatted_chunks.append(formatted_text)
+                max_chunk_retries = 5
+                for attempt in range(max_chunk_retries):
+                    try:
+                        response = await asyncio.to_thread(
+                            self.gemini_client.models.generate_content,
+                            model="gemini-2.0-flash",
+                            contents=prompt
+                        )
+                        formatted_text = response.text.strip()
+                        formatted_chunks.append(formatted_text)
+                        await asyncio.sleep(random.uniform(1.0, 2.5))  # throttle between calls
+                        break  # success, exit retry loop
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        self.logger.warning(f"Gemini chunk {idx+1}/{len(chunks)} attempt {attempt+1} failed: {error_msg}")
+
+                        if "429" in error_msg or "too many requests" in error_msg:
+                            wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+                            self.logger.warning(f"Rate limit hit. Waiting {wait_time:.1f}s before retrying...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            # not a rate limit error — retry briefly, but not aggressively
+                            await asyncio.sleep(1.0)
+
+                        if attempt == max_chunk_retries - 1:
+                            self.logger.error(f"Max retries exceeded for chunk {idx+1}. Including raw chunk as-is.")
+                            formatted_chunks.append(chunk)
 
             full_result = "\n\n".join(formatted_chunks)
             return full_result
